@@ -1,6 +1,6 @@
 # pcap-playback
 
-Replay PCAP/PCAPNG network capture files — the kind exported from Wireshark or captured with `tcpdump`/`tshark` — back onto a live network interface.
+Replay PCAP/PCAPNG network capture files — the kind exported from Wireshark or captured with `tcpdump`/`tshark` — back onto the network.
 
 ---
 
@@ -10,20 +10,40 @@ Replay PCAP/PCAPNG network capture files — the kind exported from Wireshark or
 |-------------|-------|
 | Python 3.12+ | |
 | [uv](https://docs.astral.sh/uv/) | Fast Python package manager |
-| libpcap | Linux/macOS: usually pre-installed. Install with `apt install libpcap-dev` or `brew install libpcap` |
-| Root / admin | Required for live packet sending. Not required for `--dry-run` or `preview`. |
+| libpcap | Only needed for `--mode raw`. Linux: `apt install libpcap-dev`. macOS: `brew install libpcap` |
+| Root / sudo | Only needed for `--mode raw` (live Layer-2 sending) |
 
 ---
 
 ## Installation
 
 ```bash
-# From the repo root
 cd python/pcap_playback
 uv sync
 ```
 
-That's it. `uv` creates an isolated virtual environment and installs all dependencies including scapy.
+`uv` creates an isolated virtual environment and installs all dependencies.
+
+---
+
+## Replay modes
+
+The tool has two modes, selected with `--mode`:
+
+| Mode | Default? | Root required? | What it does |
+|------|----------|----------------|--------------|
+| `socket` | **Yes** | No | Sends UDP payloads and reassembled TCP streams using normal OS sockets. The OS handles routing — no interface needed. |
+| `raw` | No | **Yes** | Full Layer-2 replay via scapy. Every header (src IP, TTL, flags, …) is sent exactly as captured. |
+
+**When to use which:**
+- Use **socket mode** (default) for replaying application traffic at a service — HTTP, DNS, database queries, etc. No root required.
+- Use **raw mode** when you need byte-for-byte wire fidelity: load testing network equipment, replaying non-TCP/UDP protocols (ICMP, ARP), or forensic replay.
+
+### Socket mode behaviour
+- **UDP**: each packet's payload is sent to the original destination IP:port, preserving inter-packet timing.
+- **TCP**: packets in the same flow (src IP:port → dst IP:port) are reassembled into one stream and sent as a single TCP connection at the time of the flow's first data packet.
+- **Other protocols** (ICMP, ARP, etc.) are skipped — use `--mode raw` for those.
+- The source IP is whatever the OS assigns (your machine's outbound IP). Use `--dst-rewrite` to redirect traffic to a different host.
 
 ---
 
@@ -31,7 +51,7 @@ That's it. `uv` creates an isolated virtual environment and installs all depende
 
 ### `preview` — inspect a file before replaying
 
-Always start here. Shows a table of the first N packets without touching the network.
+Always start here. Shows a table of the first N packets without touching the network. No root required.
 
 ```bash
 uv run pcap-playback preview capture.pcap
@@ -45,105 +65,81 @@ Example output:
  #      Timestamp                Src               Dst               Proto  Len  Summary
  1      2024-01-15 10:00:00.000  192.168.1.10      8.8.8.8           DNS    74   DNS Qry "example.com"
  2      2024-01-15 10:00:00.012  8.8.8.8           192.168.1.10      DNS    106  DNS Ans "93.184.216.34"
- 3      2024-01-15 10:00:00.025  192.168.1.10      93.184.216.34     TCP    74   TCP SYN
-...
-Showing 20 of 1 843 packet(s)
 ```
 
 ---
 
-### `play` — replay to a network interface
-
-Sends packets onto an interface, preserving the original inter-packet timing by default.
-
-**Requires root/sudo for live sending.** Use `--dry-run` to test without privileges.
+### `play` — replay a file once
 
 ```bash
-# Dry run first — no packets sent, no root required
+# Dry run — shows what would be sent; no root, no network
 uv run pcap-playback play capture.pcap --dry-run
 
-# Live replay (requires root)
-sudo uv run pcap-playback play capture.pcap --interface eth0
+# Socket mode (default) — sends to original destinations, no root needed
+uv run pcap-playback play capture.pcap
+
+# Redirect all traffic to a different host
+uv run pcap-playback play capture.pcap --dst-rewrite 192.168.1.50
 
 # Double speed
-sudo uv run pcap-playback play capture.pcap --interface eth0 --rate-multiplier 2.0
+uv run pcap-playback play capture.pcap --rate-multiplier 2.0
 
 # Maximum speed (no inter-packet delay)
-sudo uv run pcap-playback play capture.pcap --interface eth0 --rate-multiplier 0
+uv run pcap-playback play capture.pcap --rate-multiplier 0
 
-# Only replay the first 100 packets
-sudo uv run pcap-playback play capture.pcap --interface eth0 --count 100
+# Only replay UDP DNS traffic
+uv run pcap-playback play capture.pcap --filter "udp port 53"
 
-# Only replay TCP traffic (BPF filter)
-sudo uv run pcap-playback play capture.pcap --interface eth0 --filter "tcp"
-
-# Rewrite IP addresses before sending
-sudo uv run pcap-playback play capture.pcap --interface eth0 \
-    --src-rewrite 10.0.0.1 \
-    --dst-rewrite 10.0.0.2
-```
-
-**Finding your interface name:**
-```bash
-# Linux
-ip link show
-# macOS
-ifconfig -l
+# Raw mode — full Layer-2 replay (requires root)
+sudo uv run pcap-playback play capture.pcap --mode raw --interface eth0
 ```
 
 ---
 
 ### `loop` — replay continuously
 
-Replays the file over and over until you press Ctrl-C. Useful for sustained load generation.
+Replays the file over and over until Ctrl-C. Useful for sustained load generation.
 
 ```bash
-sudo uv run pcap-playback loop capture.pcap --interface eth0
-sudo uv run pcap-playback loop capture.pcap --interface eth0 --rate-multiplier 0.5
-```
-
-Output:
-```
-Looping capture.pcap — press Ctrl-C to stop
-  [1] 1 843 packets, 2 187 432 bytes, 12.401s
-  [2] 1 843 packets, 2 187 432 bytes, 12.388s
-  ^C
-Stopped after 2 iteration(s).
+uv run pcap-playback loop capture.pcap
+uv run pcap-playback loop capture.pcap --dst-rewrite 192.168.1.50 --rate-multiplier 0
+sudo uv run pcap-playback loop capture.pcap --mode raw --interface eth0
 ```
 
 ---
 
-## All Options
+## All options
 
 ### `play`
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--interface` | `-i` | system default | Network interface to send on (e.g. `eth0`, `en0`) |
-| `--rate-multiplier` | `-r` | `1.0` | Speed: `1.0`=real-time, `2.0`=double speed, `0`=max speed |
-| `--filter` | | none | BPF filter — only replay matching packets (e.g. `"tcp port 443"`) |
-| `--count` | `-n` | all | Stop after this many packets |
-| `--src-rewrite` | | none | Replace all source IP addresses with this value |
-| `--dst-rewrite` | | none | Replace all destination IP addresses with this value |
-| `--dry-run` | | off | Count and display stats without sending anything |
+| `--mode` | `-m` | `socket` | `socket` (no root) or `raw` (requires root) |
+| `--interface` | `-i` | system default | Interface for raw mode only (e.g. `eth0`, `en0`) |
+| `--rate-multiplier` | `-r` | `1.0` | Speed: `1.0`=real-time, `2.0`=double, `0`=max |
+| `--filter` | | none | BPF filter — only replay matching packets |
+| `--count` | `-n` | all | Stop after N packets |
+| `--dst-rewrite` | | none | Replace destination IP addresses |
+| `--src-rewrite` | | none | Replace source IP addresses (raw mode only) |
+| `--dry-run` | | off | Count without sending anything |
 | `--verbose` / `-v` | | off | Show debug logging |
 
 ### `preview`
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--count` | `-n` | `20` | Number of packets to show |
+| `--count` | `-n` | `20` | Rows to display |
 | `--filter` | | none | BPF filter |
 
 ### `loop`
 
-Accepts `--interface`, `--rate-multiplier`, `--filter`, `--src-rewrite`, `--dst-rewrite`.
+Accepts `--mode`, `--interface`, `--rate-multiplier`, `--filter`, `--dst-rewrite`, `--src-rewrite`.
 
 ---
 
-## BPF Filter Expressions
+## BPF filter expressions
 
-BPF (Berkeley Packet Filter) is the same filter syntax used in Wireshark and tcpdump.
+BPF is the same filter syntax used in Wireshark and tcpdump.
 
 | Expression | Matches |
 |------------|---------|
@@ -157,31 +153,36 @@ BPF (Berkeley Packet Filter) is the same filter syntax used in Wireshark and tcp
 
 ---
 
-## Common Use Cases
+## Common use cases
 
-**Test a service with real traffic from a production capture:**
+**Replay HTTP traffic at a test server (no root):**
 ```bash
-sudo uv run pcap-playback play prod-capture.pcap \
-    --interface eth0 \
+uv run pcap-playback play prod-capture.pcap \
     --dst-rewrite 192.168.1.50 \
-    --filter "tcp port 8080"
+    --filter "tcp port 80"
 ```
 
-**Generate sustained load for benchmarking:**
+**Replay DNS queries at a test resolver (no root):**
 ```bash
-sudo uv run pcap-playback loop capture.pcap \
-    --interface eth0 \
-    --rate-multiplier 0
+uv run pcap-playback play capture.pcap \
+    --dst-rewrite 10.0.0.1 \
+    --filter "udp port 53"
 ```
 
-**Check what's in a capture file before touching the network:**
+**Generate sustained load at maximum speed (no root):**
 ```bash
-uv run pcap-playback preview capture.pcap --count 100
+uv run pcap-playback loop capture.pcap --dst-rewrite 10.0.0.1 --rate-multiplier 0
 ```
 
-**Replay at half speed for debugging:**
+**Preview a capture, then dry-run to verify options:**
 ```bash
-sudo uv run pcap-playback play capture.pcap --interface lo --rate-multiplier 0.5
+uv run pcap-playback preview capture.pcap
+uv run pcap-playback play capture.pcap --dst-rewrite 10.0.0.1 --filter "udp" --dry-run
+```
+
+**Full wire-fidelity replay (raw mode, requires root):**
+```bash
+sudo uv run pcap-playback play capture.pcap --mode raw --interface eth0
 ```
 
 ---
@@ -189,13 +190,16 @@ sudo uv run pcap-playback play capture.pcap --interface lo --rate-multiplier 0.5
 ## Troubleshooting
 
 **`Operation not permitted` / `Permission denied`**
-Live packet sending requires root. Run with `sudo`, or use `--dry-run` to verify the file and options first.
+You're using `--mode raw` without root. Either add `sudo`, or switch to the default socket mode (drop the `--mode raw` flag).
 
-**`No such device` / interface not found**
+**TCP connections refused**
+In socket mode, the tool tries to connect to the original destination IP:port. If nothing is listening there, connections will fail and be counted as skipped. Use `--dst-rewrite` to point at your test server, and make sure the service is running.
+
+**Only UDP packets sent, TCP skipped**
+TCP flows are sent as complete streams. If the capture only has SYN/FIN/ACK packets with no application payload, there is nothing to send. Check with `preview` first.
+
+**`No such device` / interface not found (raw mode)**
 Check the interface name with `ip link show` (Linux) or `ifconfig -l` (macOS). Common names: `eth0`, `ens3`, `en0`, `lo`.
-
-**Scapy warning about no default route**
-You can safely ignore this when using `--dry-run`. For live replay, specify `--interface` explicitly.
 
 **Packets skipped (shown in final stats)**
 Individual send failures are non-fatal. Run with `--verbose` to see per-packet error messages.
