@@ -1,0 +1,5 @@
+[tool.uv.workspace]
+members = [
+    "python/pcap_reader",
+    "python/pcap_playback",
+]
